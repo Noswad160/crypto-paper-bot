@@ -81,9 +81,9 @@ def test_resample_to_5_minutes():
 
 
 def test_trend_filter_blocks_entries_below_long_term_trend():
-    # Long decline, then a short bounce that stays below the long-term EMA.
+    # Long decline, then a bounce on a new UTC day (fresh VWAP) that stays below the long-term EMA.
     closes = list(np.linspace(120, 100, 300)) + list(np.linspace(100, 103, 40))
-    bars = make_bars(closes)
+    bars = make_bars(closes, start="2026-01-01 19:00")
     assert add_indicators(bars, 9, 21)["entry"].iloc[300:].any()
     assert not add_indicators(bars, 9, 21, trend=200)["entry"].iloc[300:].any()
 
