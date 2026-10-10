@@ -74,11 +74,13 @@ class Bot:
         return self.halted
 
     def step(self, symbol: str):
-        bars = self.data.closed_bars_for_today(symbol, warmup_minutes=self.cfg.slow_ema * 6)
+        bars = self.data.closed_bars_for_today(symbol, warmup_minutes=max(self.cfg.slow_ema * 6, self.cfg.trend_ema * 3))
         if len(bars) < self.cfg.slow_ema * 2:
             log.info("%s: not enough bars yet (%d)", symbol, len(bars))
             return
-        last = add_indicators(bars, self.cfg.fast_ema, self.cfg.slow_ema).iloc[-1]
+        last = add_indicators(
+            bars, self.cfg.fast_ema, self.cfg.slow_ema, self.cfg.trend_ema, self.cfg.exit_on_trend
+        ).iloc[-1]
         entry = self.broker.entry_price(symbol)
         action = decide(last, entry, self.cfg)
         log.info(

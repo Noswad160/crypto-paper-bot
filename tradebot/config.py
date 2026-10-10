@@ -26,6 +26,8 @@ class Config:
     # Strategy
     fast_ema: int = field(default_factory=lambda: _i("FAST_EMA", 9))
     slow_ema: int = field(default_factory=lambda: _i("SLOW_EMA", 21))
+    trend_ema: int = field(default_factory=lambda: _i("TREND_EMA", 0))  # 0 = no long-term trend filter
+    exit_on_trend: bool = field(default_factory=lambda: os.getenv("EXIT_ON_TREND", "1") == "1")
 
     # Exits
     stop_loss_pct: float = field(default_factory=lambda: _f("STOP_LOSS_PCT", 0.0075))

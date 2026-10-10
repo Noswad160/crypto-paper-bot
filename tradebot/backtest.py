@@ -1,7 +1,7 @@
 """Replay the strategy over historical bars.
 
     python -m tradebot.backtest --symbols BTC/USD --days 14
-    python -m tradebot.backtest --sweep --days 30 --markdown results.md   # compare settings
+    python -m tradebot.backtest --sweep --days 90 --markdown results.md   # compare strategy variants
     python -m tradebot.backtest --csv mybars.csv   # columns: timestamp,open,high,low,close,volume
 
 Entries fill at the close of the signal bar. Stops and targets fill at their price as soon as a
@@ -9,7 +9,7 @@ later bar's low/high touches them (stop wins if both are touched in the same bar
 fill at the bar close. Fees are charged on both sides.
 """
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -17,12 +17,38 @@ import pandas as pd
 from .config import Config
 from .strategy import add_indicators
 
-# (bar minutes, stop loss, take profit) combinations tried by --sweep.
-SWEEP = [
-    (bars, sl, tp)
-    for bars in (1, 5, 15)
-    for sl, tp in ((0.0075, 0.015), (0.01, 0.02), (0.015, 0.03))
-]
+@dataclass(frozen=True)
+class Variant:
+    bars: int  # bar size in minutes
+    trend: int  # long-term trend filter EMA length in bars, 0 = off
+    exit_on_trend: bool  # exit when VWAP/EMA trend breaks, or only on stop/target
+    sl: float
+    tp: float
+    max_per_day: int
+    current: bool = False
+
+    def label(self) -> str:
+        parts = [f"{self.bars}m", "trend filter" if self.trend else "no filter",
+                 "trend exits" if self.exit_on_trend else "stop/target only",
+                 f"{self.sl:.1%}/{self.tp:.1%}", f"max {self.max_per_day}/day"]
+        return " · ".join(parts)
+
+    def apply(self, cfg: Config) -> Config:
+        return replace(cfg, trend_ema=self.trend, exit_on_trend=self.exit_on_trend,
+                       stop_loss_pct=self.sl, take_profit_pct=self.tp, max_trades_per_day=self.max_per_day)
+
+
+def variants(cfg: Config) -> list[Variant]:
+    """What the live bot does now, plus slower, pickier ideas meant to trade less and aim for bigger moves."""
+    current = Variant(1, cfg.trend_ema, cfg.exit_on_trend, cfg.stop_loss_pct, cfg.take_profit_pct,
+                      cfg.max_trades_per_day, current=True)
+    return [current] + [
+        Variant(bars, trend, exit_on_trend, sl, tp, 2)
+        for bars in (15, 60)
+        for trend in (0, 200)
+        for exit_on_trend in (True, False)
+        for sl, tp in ((0.015, 0.03), (0.025, 0.05), (0.04, 0.08))
+    ]
 
 
 def resample(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
@@ -33,7 +59,7 @@ def resample(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
 
 
 def backtest(bars: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    df = add_indicators(bars, cfg.fast_ema, cfg.slow_ema)
+    df = add_indicators(bars, cfg.fast_ema, cfg.slow_ema, cfg.trend_ema, cfg.exit_on_trend)
     size = cfg.position_notional_usd
     trades, entry, entry_time = [], None, None
     entries_per_day: dict = {}
@@ -94,47 +120,71 @@ def summarize(trades: pd.DataFrame) -> str:
     ])
 
 
-def sweep(bars_1m: pd.DataFrame, cfg: Config) -> list[dict]:
+MIN_TRADES = 5
+
+
+def hold_pnl(bars: pd.DataFrame, cfg: Config) -> float:
+    return cfg.position_notional_usd * (bars["close"].iloc[-1] / bars["close"].iloc[0] - 1)
+
+
+def sweep(bars_1m: pd.DataFrame, cfg: Config, split: float = 2 / 3) -> tuple[list[dict], pd.Timestamp]:
+    """Run every variant. Trades are split by entry time into an earlier period, used to pick
+    the best variant, and a recent period the pick never saw, used to check it."""
+    cutoff = bars_1m.index[0] + (bars_1m.index[-1] - bars_1m.index[0]) * split
     rows = []
-    for minutes, sl, tp in SWEEP:
-        c = replace(cfg, stop_loss_pct=sl, take_profit_pct=tp)
-        s = stats(backtest(resample(bars_1m, minutes), c))
-        current = minutes == 1 and sl == cfg.stop_loss_pct and tp == cfg.take_profit_pct
-        rows.append({"bars": minutes, "sl": sl, "tp": tp, "current": current, **s})
-    return rows
+    for v in variants(cfg):
+        trades = backtest(resample(bars_1m, v.bars), v.apply(cfg))
+        early = trades[trades.entry_time < cutoff] if not trades.empty else trades
+        late = trades[trades.entry_time >= cutoff] if not trades.empty else trades
+        rows.append({"v": v, "all": stats(trades), "early": stats(early), "late": stats(late)})
+    # A variant needs a handful of trades before its result means anything.
+    rows.sort(key=lambda r: (r["early"]["trades"] >= MIN_TRADES, r["early"]["net"]), reverse=True)
+    return rows, cutoff
 
 
-def sweep_markdown(symbol: str, bars_1m: pd.DataFrame, rows: list[dict], cfg: Config) -> str:
-    hold = cfg.position_notional_usd * (bars_1m["close"].iloc[-1] / bars_1m["close"].iloc[0] - 1)
-    best = max(rows, key=lambda r: r["net"])
+def sweep_markdown(symbol: str, bars_1m: pd.DataFrame, rows: list[dict], cutoff, cfg: Config) -> str:
+    early_hold = hold_pnl(bars_1m[bars_1m.index < cutoff], cfg)
+    late_hold = hold_pnl(bars_1m[bars_1m.index >= cutoff], cfg)
     out = [
         f"### {symbol}",
-        f"{bars_1m.index[0]:%b %d} → {bars_1m.index[-1]:%b %d %H:%M} UTC · "
-        f"buy & hold ${cfg.position_notional_usd:,.0f} would have made **${hold:+,.2f}**",
+        f"Earlier period: {bars_1m.index[0]:%b %d} → {cutoff:%b %d} (buy & hold **${early_hold:+,.0f}**). "
+        f"Recent period: {cutoff:%b %d} → {bars_1m.index[-1]:%b %d} (buy & hold **${late_hold:+,.0f}**).",
         "",
-        "| Bars | Stop | Target | Trades | Win % | Net P&L | Fees | Max drawdown |",
-        "|---|---|---|---|---|---|---|---|",
+        f"Sorted by the earlier period (setups with under {MIN_TRADES} earlier trades go last). "
+        "The recent column is the honest check.",
+        "",
+        "| Setup | Earlier trades | Earlier P&L | Recent trades | Recent P&L | Win % | Fees |",
+        "|---|---|---|---|---|---|---|",
     ]
     for r in rows:
-        label = f"{r['bars']} min" + (" ← current" if r["current"] else "") + (" ⭐" if r is best else "")
-        out.append(
-            f"| {label} | {r['sl']:.2%} | {r['tp']:.1%} | {r['trades']} | {r['win_rate']:.0%} | "
-            f"**${r['net']:+,.2f}** | ${r['fees']:,.2f} | ${r['max_dd']:,.2f} |"
-        )
+        v, e, l, a = r["v"], r["early"], r["late"], r["all"]
+        label = v.label() + (" ← current" if v.current else "")
+        out.append(f"| {label} | {e['trades']} | ${e['net']:+,.0f} | {l['trades']} | **${l['net']:+,.0f}** | "
+                   f"{a['win_rate']:.0%} | ${a['fees']:,.0f} |")
     return "\n".join(out) + "\n"
 
 
-def sweep_text(symbol: str, bars_1m: pd.DataFrame, rows: list[dict], cfg: Config) -> str:
+def sweep_text(symbol: str, bars_1m: pd.DataFrame, rows: list[dict], cutoff, cfg: Config) -> str:
     """Short plain-text version of the sweep, sized for a phone notification."""
-    hold = cfg.position_notional_usd * (bars_1m["close"].iloc[-1] / bars_1m["close"].iloc[0] - 1)
-    current = next((r for r in rows if r["current"]), rows[0])
-    best = max(rows, key=lambda r: r["net"])
+    early_hold = hold_pnl(bars_1m[bars_1m.index < cutoff], cfg)
+    late_hold = hold_pnl(bars_1m[bars_1m.index >= cutoff], cfg)
+    current = next(r for r in rows if r["v"].current)
+    both = sum(r["early"]["net"] > 0 and r["late"]["net"] > 0 for r in rows if not r["v"].current)
 
-    def line(r):
-        return (f"{r['bars']}m bars, stop {r['sl']:.2%} / target {r['tp']:.1%}: "
-                f"{r['trades']} trades, {r['win_rate']:.0%} wins, ${r['net']:+,.0f}")
+    def nums(r):
+        return (f"earlier ${r['early']['net']:+,.0f} ({r['early']['trades']}), "
+                f"recent ${r['late']['net']:+,.0f} ({r['late']['trades']})")
 
-    return f"{symbol} (hold: ${hold:+,.0f})\nNow: {line(current)}\nBest: {line(best)}\n"
+    lines = [
+        f"{symbol}",
+        f"Hold: earlier ${early_hold:+,.0f}, recent ${late_hold:+,.0f}",
+        f"Current bot: {nums(current)}",
+        "Top 3 (picked on earlier data):",
+    ]
+    for i, r in enumerate([r for r in rows if not r["v"].current][:3], 1):
+        lines.append(f"{i}. {r['v'].label()}: {nums(r)}")
+    lines.append(f"Profitable in both periods: {both} of {len(rows) - 1}")
+    return "\n".join(lines) + "\n"
 
 
 def load_bars(args, cfg: Config, symbol: str) -> pd.DataFrame:
@@ -163,7 +213,7 @@ def main():
     md = [
         f"## Backtest: last {args.days} days\n",
         f"${cfg.position_notional_usd:,.0f} per trade, {cfg.fee_pct:.2%} fee per side, "
-        f"EMA {cfg.fast_ema}/{cfg.slow_ema}, max {cfg.max_trades_per_day} trades/day. "
+        f"EMA {cfg.fast_ema}/{cfg.slow_ema}, trend filter EMA 200 bars. "
         "Past results don't predict future ones.\n",
     ]
     text = []
@@ -171,11 +221,11 @@ def main():
         bars = load_bars(args, cfg, symbol)
         print(f"\n{symbol}: {len(bars)} bars, {bars.index[0]} -> {bars.index[-1]}")
         if args.sweep:
-            rows = sweep(bars, cfg)
-            table = sweep_markdown(symbol, bars, rows, cfg)
+            rows, cutoff = sweep(bars, cfg)
+            table = sweep_markdown(symbol, bars, rows, cutoff, cfg)
             print(table)
             md.append(table)
-            text.append(sweep_text(symbol, bars, rows, cfg))
+            text.append(sweep_text(symbol, bars, rows, cutoff, cfg))
         else:
             trades = backtest(bars, cfg)
             print(summarize(trades))
@@ -188,7 +238,7 @@ def main():
             f.write("\n".join(md))
     if args.sweep and args.text:
         with open(args.text, "w") as f:
-            f.write(f"Last {args.days} days, after fees\n\n" + "\n".join(text))
+            f.write(f"Last {args.days} days, after fees. Dollar P&L, trade count in brackets.\n\n" + "\n".join(text))
 
 
 if __name__ == "__main__":

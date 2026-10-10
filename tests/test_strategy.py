@@ -78,3 +78,16 @@ def test_resample_to_5_minutes():
     bars = make_bars(range(100, 110))
     r = resample(bars, 5)
     assert len(r) == 2 and r["open"].iloc[0] == 100 and r["close"].iloc[0] == 104 and r["volume"].iloc[0] == 5
+
+
+def test_trend_filter_blocks_entries_below_long_term_trend():
+    # Long decline, then a short bounce that stays below the long-term EMA.
+    closes = list(np.linspace(120, 100, 300)) + list(np.linspace(100, 103, 40))
+    bars = make_bars(closes)
+    assert add_indicators(bars, 9, 21)["entry"].iloc[300:].any()
+    assert not add_indicators(bars, 9, 21, trend=200)["entry"].iloc[300:].any()
+
+
+def test_stop_target_only_ignores_trend_breaks():
+    df = add_indicators(make_bars(np.linspace(110, 100, 60)), 9, 21, exit_on_trend=False)
+    assert not df["trend_broken"].any()

@@ -6,7 +6,7 @@ on:
     inputs:
       days:
         description: "How many days of history"
-        default: "30"
+        default: "90"
       symbols:
         description: "Symbols (comma-separated)"
         default: "BTC/USD,ETH/USD"
