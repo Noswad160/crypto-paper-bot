@@ -17,7 +17,8 @@ cp .env.example .env   # paste your PAPER keys from app.alpaca.markets
 
 ## Use
 ```bash
-python -m tradebot.backtest --symbol BTC/USD --days 14   # try it on history first (no keys needed)
+python -m tradebot.backtest --symbols BTC/USD --days 14  # try it on history first (no keys needed)
+python -m tradebot.backtest --sweep --days 30            # compare bar sizes and stop/target settings
 python -m tradebot.live --dry-run                         # live signals only, no orders
 python -m tradebot.live                                   # paper trade
 pytest                                                    # unit tests
@@ -38,3 +39,6 @@ Logs go to `logs/bot.log`, and every order is recorded in `logs/trades.csv`.
 
 To stop it: **Actions → Paper trading bot → ⋯ → Disable workflow**, then cancel any running job.
 GitHub pauses scheduled workflows after 60 days without commits to the repo; re-enable it from the Actions tab.
+
+### Backtesting from your phone
+**Actions → Backtest → Run workflow.** It compares 1/5/15-minute bars and three stop/target pairs over recent history, after fees, and puts a table on the run's summary page. If `NTFY_TOPIC` is set, you get a push when it finishes.

@@ -1,0 +1,43 @@
+name: Backtest
+
+# Run from the Actions tab: Backtest -> Run workflow. Results appear on the run's summary page.
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "How many days of history"
+        default: "30"
+      symbols:
+        description: "Symbols (comma-separated)"
+        default: "BTC/USD,ETH/USD"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run backtest
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          DAYS: ${{ inputs.days }}
+          SYMBOLS: ${{ inputs.symbols }}
+        run: |
+          python -m tradebot.backtest --sweep --days "$DAYS" --symbols "$SYMBOLS" --markdown results.md
+          cat results.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Send alert
+        if: always()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OK: ${{ job.status == 'success' }}
+        run: |
+          [ -n "$NTFY_TOPIC" ] || exit 0
+          if [ "$OK" = "true" ]; then title="Backtest finished"; msg="Tap to see results"; else title="Backtest failed"; msg="Tap to see what went wrong"; fi
+          curl -s -H "Title: $title" -H "Tags: bar_chart" -H "Click: $RUN_URL" -d "$msg" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null

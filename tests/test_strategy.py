@@ -62,3 +62,19 @@ def test_backtest_charges_fees():
     with_fee = backtest(make_bars(closes), cfg(fee_pct=0.0025, take_profit_pct=0.02))
     assert len(no_fee) == len(with_fee) >= 1
     assert with_fee.pnl.sum() < no_fee.pnl.sum()
+
+
+def test_backtest_stop_fills_at_stop_price_intrabar():
+    closes = [100] * 60 + list(np.linspace(100, 101, 10)) + [101] * 5
+    bars = make_bars(closes)
+    bars.iloc[-3, bars.columns.get_loc("low")] = 90  # one bar wicks far below the stop
+    trades = backtest(bars, cfg(fee_pct=0.0, stop_loss_pct=0.01, take_profit_pct=0.5))
+    stop = trades[trades.reason == "stop_loss"].iloc[0]
+    assert stop.exit == stop.entry * 0.99
+
+
+def test_resample_to_5_minutes():
+    from tradebot.backtest import resample
+    bars = make_bars(range(100, 110))
+    r = resample(bars, 5)
+    assert len(r) == 2 and r["open"].iloc[0] == 100 and r["close"].iloc[0] == 104 and r["volume"].iloc[0] == 5
