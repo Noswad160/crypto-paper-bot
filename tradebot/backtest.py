@@ -1,12 +1,13 @@
 """Replay the strategy over historical bars.
 
-    python -m tradebot.backtest --symbols BTC/USD --days 14
-    python -m tradebot.backtest --sweep --days 90 --markdown results.md   # compare strategy variants
+    python -m tradebot.backtest --symbols SPY --days 30
+    python -m tradebot.backtest --sweep --days 90 --text results.txt   # compare strategy variants
     python -m tradebot.backtest --csv mybars.csv   # columns: timestamp,open,high,low,close,volume
 
 Entries fill at the close of the signal bar. Stops and targets fill at their price as soon as a
 later bar's low/high touches them (stop wins if both are touched in the same bar). Trend exits
-fill at the bar close. Fees are charged on both sides.
+and end-of-day exits fill at the bar close. Costs (FEE_PCT) are charged on both sides.
+Stocks: only regular hours, entries 9:45-15:30 New York time, always flat by the close.
 """
 import argparse
 from dataclasses import dataclass, replace
@@ -15,7 +16,12 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from .config import Config
+from .data import resample
+from .session import add_session_flags
 from .strategy import add_indicators
+
+MIN_TRADES = 5  # a variant needs this many trades in the earlier period before its result counts
+
 
 @dataclass(frozen=True)
 class Variant:
@@ -34,41 +40,43 @@ class Variant:
         return " · ".join(parts)
 
     def apply(self, cfg: Config) -> Config:
-        return replace(cfg, trend_ema=self.trend, exit_on_trend=self.exit_on_trend,
+        return replace(cfg, bar_minutes=self.bars, trend_ema=self.trend, exit_on_trend=self.exit_on_trend,
                        stop_loss_pct=self.sl, take_profit_pct=self.tp, max_trades_per_day=self.max_per_day)
 
 
 def variants(cfg: Config) -> list[Variant]:
-    """What the live bot does now, plus slower, pickier ideas meant to trade less and aim for bigger moves."""
-    current = Variant(1, cfg.trend_ema, cfg.exit_on_trend, cfg.stop_loss_pct, cfg.take_profit_pct,
-                      cfg.max_trades_per_day, current=True)
-    return [current] + [
-        Variant(bars, trend, exit_on_trend, sl, tp, 2)
-        for bars in (15, 60)
+    """What the live bot does now, plus a grid of alternatives."""
+    current = Variant(cfg.bar_minutes, cfg.trend_ema, cfg.exit_on_trend, cfg.stop_loss_pct,
+                      cfg.take_profit_pct, cfg.max_trades_per_day, current=True)
+    if cfg.stocks:
+        # Commission-free, so faster bars and tighter exits are worth testing. Moves within a
+        # single stock-market day are smaller than crypto's, so targets are smaller too.
+        grid = dict(bars=(1, 5, 15), stops=((0.005, 0.01), (0.01, 0.02), (0.02, 0.04)), per_day=4)
+    else:
+        grid = dict(bars=(15, 60), stops=((0.015, 0.03), (0.025, 0.05), (0.04, 0.08)), per_day=2)
+    others = [
+        Variant(bars, trend, exit_on_trend, sl, tp, grid["per_day"])
+        for bars in grid["bars"]
         for trend in (0, 200)
         for exit_on_trend in (True, False)
-        for sl, tp in ((0.015, 0.03), (0.025, 0.05), (0.04, 0.08))
+        for sl, tp in grid["stops"]
     ]
-
-
-def resample(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    if minutes == 1:
-        return bars
-    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    return bars.resample(f"{minutes}min", label="left", closed="left").agg(agg).dropna()
+    return [current] + [v for v in others if replace(v, current=True) != current]
 
 
 def backtest(bars: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    df = add_indicators(bars, cfg.fast_ema, cfg.slow_ema, cfg.trend_ema, cfg.exit_on_trend)
+    df = add_indicators(bars, cfg.fast_ema, cfg.slow_ema, cfg.trend_ema, cfg.exit_on_trend, cfg.session_tz)
+    df = add_session_flags(df, cfg.stocks, cfg.bar_minutes)
+    days = df.index.tz_convert(cfg.session_tz).date
     size = cfg.position_notional_usd
     trades, entry, entry_time = [], None, None
     entries_per_day: dict = {}
-    for ts, high, low, close, is_entry, broken in zip(
-        df.index, df["high"], df["low"], df["close"], df["entry"], df["trend_broken"]
+    for ts, day, high, low, close, is_entry, broken, can_enter, session_end in zip(
+        df.index, days, df["high"], df["low"], df["close"], df["entry"], df["trend_broken"],
+        df["can_enter"], df["session_end"],
     ):
         if entry is None:
-            day = ts.date()
-            if is_entry and entries_per_day.get(day, 0) < cfg.max_trades_per_day:
+            if is_entry and can_enter and entries_per_day.get(day, 0) < cfg.max_trades_per_day:
                 entries_per_day[day] = entries_per_day.get(day, 0) + 1
                 entry, entry_time = close, ts
             continue
@@ -79,6 +87,8 @@ def backtest(bars: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             exit_price, reason = target, "take_profit"
         elif broken:
             exit_price, reason = close, "trend_broken"
+        elif session_end:
+            exit_price, reason = close, "end_of_day"
         else:
             continue
         gross = size * (exit_price / entry - 1)
@@ -113,78 +123,89 @@ def summarize(trades: pd.DataFrame) -> str:
     return "\n".join([
         f"Trades:        {s['trades']}",
         f"Win rate:      {s['win_rate']:.1%}",
-        f"Net P&L:       ${s['net']:,.2f}  (fees ${s['fees']:,.2f})",
+        f"Net P&L:       ${s['net']:,.2f}  (costs ${s['fees']:,.2f})",
         f"Avg trade:     ${s['avg']:,.2f}",
         f"Max drawdown:  ${s['max_dd']:,.2f}",
         f"Exit reasons:  {s['reasons']}",
     ])
 
 
-MIN_TRADES = 5
-
-
 def hold_pnl(bars: pd.DataFrame, cfg: Config) -> float:
-    return cfg.position_notional_usd * (bars["close"].iloc[-1] / bars["close"].iloc[0] - 1)
+    return cfg.position_notional_usd * (bars["close"].iloc[-1] / bars["close"].iloc[0] - 1) if len(bars) else 0.0
 
 
-def sweep(bars_1m: pd.DataFrame, cfg: Config, split: float = 2 / 3) -> tuple[list[dict], pd.Timestamp]:
+def rank_key(r: dict):
+    return (r["early"]["trades"] >= MIN_TRADES, r["early"]["net"])
+
+
+def sweep(bars_1m: pd.DataFrame, cfg: Config, cutoff: pd.Timestamp) -> list[dict]:
     """Run every variant. Trades are split by entry time into an earlier period, used to pick
     the best variant, and a recent period the pick never saw, used to check it."""
-    cutoff = bars_1m.index[0] + (bars_1m.index[-1] - bars_1m.index[0]) * split
     rows = []
     for v in variants(cfg):
         trades = backtest(resample(bars_1m, v.bars), v.apply(cfg))
         early = trades[trades.entry_time < cutoff] if not trades.empty else trades
         late = trades[trades.entry_time >= cutoff] if not trades.empty else trades
         rows.append({"v": v, "all": stats(trades), "early": stats(early), "late": stats(late)})
-    # A variant needs a handful of trades before its result means anything.
-    rows.sort(key=lambda r: (r["early"]["trades"] >= MIN_TRADES, r["early"]["net"]), reverse=True)
-    return rows, cutoff
+    return sorted(rows, key=rank_key, reverse=True)
 
 
-def sweep_markdown(symbol: str, bars_1m: pd.DataFrame, rows: list[dict], cutoff, cfg: Config) -> str:
-    early_hold = hold_pnl(bars_1m[bars_1m.index < cutoff], cfg)
-    late_hold = hold_pnl(bars_1m[bars_1m.index >= cutoff], cfg)
-    out = [
-        f"### {symbol}",
-        f"Earlier period: {bars_1m.index[0]:%b %d} → {cutoff:%b %d} (buy & hold **${early_hold:+,.0f}**). "
-        f"Recent period: {cutoff:%b %d} → {bars_1m.index[-1]:%b %d} (buy & hold **${late_hold:+,.0f}**).",
-        "",
-        f"Sorted by the earlier period (setups with under {MIN_TRADES} earlier trades go last). "
-        "The recent column is the honest check.",
-        "",
-        "| Setup | Earlier trades | Earlier P&L | Recent trades | Recent P&L | Win % | Fees |",
-        "|---|---|---|---|---|---|---|",
-    ]
-    for r in rows:
-        v, e, l, a = r["v"], r["early"], r["late"], r["all"]
-        label = v.label() + (" ← current" if v.current else "")
-        out.append(f"| {label} | {e['trades']} | ${e['net']:+,.0f} | {l['trades']} | **${l['net']:+,.0f}** | "
-                   f"{a['win_rate']:.0%} | ${a['fees']:,.0f} |")
-    return "\n".join(out) + "\n"
+def combine(per_symbol: dict[str, list[dict]]) -> list[dict]:
+    """Add each variant's results up across all symbols."""
+    totals: dict[Variant, dict] = {}
+    for rows in per_symbol.values():
+        for r in rows:
+            t = totals.setdefault(r["v"], {"v": r["v"], "early": {"net": 0.0, "trades": 0},
+                                           "late": {"net": 0.0, "trades": 0}, "symbols_both": 0})
+            for period in ("early", "late"):
+                t[period]["net"] += r[period]["net"]
+                t[period]["trades"] += r[period]["trades"]
+            t["symbols_both"] += r["early"]["net"] > 0 and r["late"]["net"] > 0
+    return sorted(totals.values(), key=rank_key, reverse=True)
 
 
-def sweep_text(symbol: str, bars_1m: pd.DataFrame, rows: list[dict], cutoff, cfg: Config) -> str:
-    """Short plain-text version of the sweep, sized for a phone notification."""
-    early_hold = hold_pnl(bars_1m[bars_1m.index < cutoff], cfg)
-    late_hold = hold_pnl(bars_1m[bars_1m.index >= cutoff], cfg)
+def nums(r: dict) -> str:
+    return (f"earlier ${r['early']['net']:+,.0f} ({r['early']['trades']}), "
+            f"recent ${r['late']['net']:+,.0f} ({r['late']['trades']})")
+
+
+def symbol_text(symbol: str, early_hold: float, late_hold: float, rows: list[dict]) -> str:
     current = next(r for r in rows if r["v"].current)
+    best = next(r for r in rows if not r["v"].current)
     both = sum(r["early"]["net"] > 0 and r["late"]["net"] > 0 for r in rows if not r["v"].current)
+    return "\n".join([
+        f"{symbol} (hold: earlier ${early_hold:+,.0f}, recent ${late_hold:+,.0f})",
+        f"Current: {nums(current)}",
+        f"Best: {best['v'].label()}: {nums(best)}",
+        f"Profitable in both: {both} of {len(rows) - 1}",
+    ]) + "\n"
 
-    def nums(r):
-        return (f"earlier ${r['early']['net']:+,.0f} ({r['early']['trades']}), "
-                f"recent ${r['late']['net']:+,.0f} ({r['late']['trades']})")
 
+def overall_text(combined: list[dict], n_symbols: int, early_hold: float, late_hold: float) -> str:
+    current = next(r for r in combined if r["v"].current)
+    others = [r for r in combined if not r["v"].current]
     lines = [
-        f"{symbol}",
-        f"Hold: earlier ${early_hold:+,.0f}, recent ${late_hold:+,.0f}",
-        f"Current bot: {nums(current)}",
+        f"ALL {n_symbols} SYMBOLS COMBINED",
+        f"Hold all: earlier ${early_hold:+,.0f}, recent ${late_hold:+,.0f}",
+        f"Current: {nums(current)}",
         "Top 3 (picked on earlier data):",
     ]
-    for i, r in enumerate([r for r in rows if not r["v"].current][:3], 1):
-        lines.append(f"{i}. {r['v'].label()}: {nums(r)}")
-    lines.append(f"Profitable in both periods: {both} of {len(rows) - 1}")
+    for i, r in enumerate(others[:3], 1):
+        lines.append(f"{i}. {r['v'].label()}: {nums(r)}, works on {r['symbols_both']}/{n_symbols}")
+    robust = sum(r["early"]["net"] > 0 and r["late"]["net"] > 0 for r in others)
+    lines.append(f"Profitable in both periods overall: {robust} of {len(others)}")
     return "\n".join(lines) + "\n"
+
+
+def markdown_table(title: str, rows: list[dict], extra_col: bool = False) -> str:
+    head = "| Setup | Earlier trades | Earlier P&L | Recent trades | Recent P&L |" + (" Works on |" if extra_col else "")
+    out = [f"### {title}", "", head, "|---" * (6 if extra_col else 5) + "|"]
+    for r in rows:
+        label = r["v"].label() + (" ← current" if r["v"].current else "")
+        line = (f"| {label} | {r['early']['trades']} | ${r['early']['net']:+,.0f} | "
+                f"{r['late']['trades']} | **${r['late']['net']:+,.0f}** |")
+        out.append(line + (f" {r['symbols_both']} |" if extra_col else ""))
+    return "\n".join(out) + "\n"
 
 
 def load_bars(args, cfg: Config, symbol: str) -> pd.DataFrame:
@@ -192,53 +213,67 @@ def load_bars(args, cfg: Config, symbol: str) -> pd.DataFrame:
         bars = pd.read_csv(args.csv, parse_dates=["timestamp"], index_col="timestamp")
         bars.index = pd.to_datetime(bars.index, utc=True)
         return bars
-    from .data import CryptoData
+    from .data import MarketData
     end = datetime.now(timezone.utc)
-    return CryptoData(cfg.api_key, cfg.secret_key).minute_bars(symbol, end - timedelta(days=args.days), end)
+    return MarketData(cfg.stocks, cfg.api_key, cfg.secret_key).minute_bars(symbol, end - timedelta(days=args.days), end)
 
 
 def main():
+    cfg = Config()
     p = argparse.ArgumentParser()
-    p.add_argument("--symbols", default="BTC/USD", help="comma-separated, e.g. BTC/USD,ETH/USD")
-    p.add_argument("--days", type=int, default=7)
+    p.add_argument("--symbols", default=",".join(cfg.symbols), help="comma-separated, e.g. SPY,QQQ")
+    p.add_argument("--days", type=int, default=30)
     p.add_argument("--csv", help="load bars from a CSV instead of Alpaca")
-    p.add_argument("--sweep", action="store_true", help="compare bar sizes and stop/target settings")
-    p.add_argument("--markdown", help="with --sweep, also write the results table to this file")
+    p.add_argument("--sweep", action="store_true", help="compare strategy variants")
+    p.add_argument("--markdown", help="with --sweep, also write result tables to this file")
     p.add_argument("--text", help="with --sweep, also write a short plain-text summary to this file")
     p.add_argument("--out", help="write the trade list to this CSV")
     args = p.parse_args()
-    cfg = Config()
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
-    md = [
-        f"## Backtest: last {args.days} days\n",
-        f"${cfg.position_notional_usd:,.0f} per trade, {cfg.fee_pct:.2%} fee per side, "
-        f"EMA {cfg.fast_ema}/{cfg.slow_ema}, trend filter EMA 200 bars. "
-        "Past results don't predict future ones.\n",
-    ]
-    text = []
+    end = datetime.now(timezone.utc)
+    cutoff = pd.Timestamp(end - timedelta(days=args.days / 3))  # last third of the window = "recent"
+    per_symbol, text, md = {}, [], []
+    early_hold_total = late_hold_total = 0.0
     for symbol in symbols:
         bars = load_bars(args, cfg, symbol)
+        if bars.empty:
+            print(f"\n{symbol}: no data")
+            continue
         print(f"\n{symbol}: {len(bars)} bars, {bars.index[0]} -> {bars.index[-1]}")
-        if args.sweep:
-            rows, cutoff = sweep(bars, cfg)
-            table = sweep_markdown(symbol, bars, rows, cutoff, cfg)
-            print(table)
-            md.append(table)
-            text.append(sweep_text(symbol, bars, rows, cutoff, cfg))
-        else:
+        if not args.sweep:
             trades = backtest(bars, cfg)
             print(summarize(trades))
             if args.out and not trades.empty:
                 trades.to_csv(args.out, index=False)
                 print(f"Trades written to {args.out}")
+            continue
+        if args.csv:  # CSV data may not end today; split it two-thirds / one-third instead
+            cutoff = bars.index[0] + (bars.index[-1] - bars.index[0]) * 2 / 3
+        rows = sweep(bars, cfg, cutoff)
+        per_symbol[symbol] = rows
+        early_hold = hold_pnl(bars[bars.index < cutoff], cfg)
+        late_hold = hold_pnl(bars[bars.index >= cutoff], cfg)
+        early_hold_total += early_hold
+        late_hold_total += late_hold
+        text.append(symbol_text(symbol, early_hold, late_hold, rows))
+        md.append(markdown_table(f"{symbol} (buy & hold: earlier ${early_hold:+,.0f}, recent ${late_hold:+,.0f})", rows))
+        print(text[-1])
 
-    if args.sweep and args.markdown:
-        with open(args.markdown, "w") as f:
-            f.write("\n".join(md))
-    if args.sweep and args.text:
+    if not args.sweep or not per_symbol:
+        return
+    combined = combine(per_symbol)
+    overall = overall_text(combined, len(per_symbol), early_hold_total, late_hold_total)
+    print(overall)
+    header = (f"Last {args.days} days, after {cfg.fee_pct:.2%}/side costs. ${cfg.position_notional_usd:,.0f} per trade. "
+              f"Dollar P&L, trade count in brackets. Recent = last {args.days // 3} days.\n\n")
+    if args.text:
         with open(args.text, "w") as f:
-            f.write(f"Last {args.days} days, after fees. Dollar P&L, trade count in brackets.\n\n" + "\n".join(text))
+            f.write(header + overall + "\n" + "\n".join(text))
+    if args.markdown:
+        with open(args.markdown, "w") as f:
+            f.write(f"## Backtest\n\n{header}" + markdown_table("All symbols combined", combined, extra_col=True)
+                    + "\n" + "\n".join(md))
 
 
 if __name__ == "__main__":

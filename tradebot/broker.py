@@ -44,10 +44,14 @@ class PaperBroker:
         orders = self.client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
         return len(orders) > 0
 
+    def clock(self):
+        """Market clock: .is_open, .next_open, .next_close."""
+        return self.client.get_clock()
+
     def buy(self, symbol: str, notional_usd: float):
-        req = MarketOrderRequest(
-            symbol=symbol, notional=round(notional_usd, 2), side=OrderSide.BUY, time_in_force=TimeInForce.GTC
-        )
+        # Dollar-amount (fractional) stock orders must be DAY orders; crypto uses GTC.
+        tif = TimeInForce.GTC if "/" in symbol else TimeInForce.DAY
+        req = MarketOrderRequest(symbol=symbol, notional=round(notional_usd, 2), side=OrderSide.BUY, time_in_force=tif)
         return self.client.submit_order(req)
 
     def close(self, symbol: str):

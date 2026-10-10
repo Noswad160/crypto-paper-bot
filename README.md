@@ -1,12 +1,18 @@
-# Crypto paper day-trading bot (Alpaca)
+# Paper day-trading bot (Alpaca)
 
-Trades BTC/USD and ETH/USD on 1-minute bars in an **Alpaca paper account**. Paper mode is hard-coded in `tradebot/broker.py`.
+Day-trades US stocks (default) or crypto on an **Alpaca paper account**. Paper mode is hard-coded in `tradebot/broker.py`.
 
 ## Strategy: VWAP + EMA momentum (long only)
-- **VWAP** is anchored at 00:00 UTC each day.
-- **Entry:** on the bar where *close > VWAP and EMA(9) > EMA(21)* first becomes true.
-- **Exit:** stop loss (-0.75%), take profit (+1.5%), or the trend breaking (close < VWAP or EMA9 < EMA21).
-- **Risk:** fixed $ size per trade, max trades per UTC day, and a daily loss limit that flattens everything and pauses trading until the next UTC day.
+- **VWAP** restarts each trading day (the stock market day in New York, or 00:00 UTC for crypto).
+- **Entry:** on the bar where *close > VWAP and EMA(9) > EMA(21)* first becomes true. An optional long-term trend filter (`TREND_EMA`) also requires the close to be above a slow EMA.
+- **Exit:** stop loss, take profit, or (if `EXIT_ON_TREND=1`) the trend breaking.
+- **Stocks:** regular hours only. No entries before 9:45 or after 15:30 New York time, and everything is sold at 15:55. Nothing is held overnight.
+- **Risk:** fixed $ size per trade, max trades per day, and a daily loss limit that sells everything and pauses until the next day.
+
+## Why stocks
+The crypto version lost money in every backtest: Alpaca's ~0.25% crypto fee per side cost more than the strategy made. Stock trades on Alpaca are commission-free, so the backtester only charges 0.02% per side for the spread.
+
+**Pattern day trader rule:** US accounts under $25k are limited to 3 day trades per 5 business days, and paper accounts enforce it too. The default $100k paper account is above that limit.
 
 ## Setup
 ```bash
@@ -17,28 +23,17 @@ cp .env.example .env   # paste your PAPER keys from app.alpaca.markets
 
 ## Use
 ```bash
-python -m tradebot.backtest --symbols BTC/USD --days 14  # try it on history first (no keys needed)
-python -m tradebot.backtest --sweep --days 30            # compare bar sizes and stop/target settings
-python -m tradebot.live --dry-run                         # live signals only, no orders
-python -m tradebot.live                                   # paper trade
-pytest                                                    # unit tests
+python -m tradebot.backtest --symbols SPY,QQQ --days 30           # one backtest
+python -m tradebot.backtest --sweep --days 90 --text results.txt  # compare strategy variants
+python -m tradebot.live --dry-run                                 # live signals only, no orders
+python -m tradebot.live                                           # paper trade
+pytest                                                            # tests
 ```
-Logs go to `logs/bot.log`, and every order is recorded in `logs/trades.csv`.
-
-## Notes
-- Alpaca charges crypto fees (~0.25% per side at the base tier). The backtest includes them via `FEE_PCT`, and on 1-minute bars fees make a big difference.
-- Stops are checked on each closed 1-minute bar, so live fills can land past the stop level.
-- All settings can be changed in `.env` (see `.env.example`).
+Set `ASSET_CLASS=crypto` (and crypto `SYMBOLS`) to trade crypto instead. All settings are listed in `.env.example`.
 
 ## Running on GitHub (no computer needed)
-`.github/workflows/bot.yml` runs the bot on GitHub Actions.
-1. In the repo, open **Settings → Secrets and variables → Actions** and add `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (your paper keys).
-2. Open the **Actions** tab → **Paper trading bot** → **Run workflow** to start right away. After that it keeps itself going on an hourly schedule.
-3. Optional phone alerts: install the **ntfy** app, subscribe to a hard-to-guess topic name, and add that name as a third secret, `NTFY_TOPIC`. You'll get a push for every buy, every sell, the daily loss limit, and errors.
-4. Watch trades in the Alpaca app. Each run's log is attached to its run in the Actions tab.
+- **Paper trading bot** (`.github/workflows/bot.yml`) runs on weekdays around market hours. Add `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` under **Settings → Secrets and variables → Actions**, then enable it in the **Actions** tab.
+- **Backtest** (`.github/workflows/backtest.yml`): **Actions → Backtest → Run workflow.** It compares variants over the earlier two thirds of the period, then reports how they did in the most recent third, which they never saw.
+- **Phone alerts:** install the **ntfy** app, subscribe to a hard-to-guess topic name, and add it as the secret `NTFY_TOPIC`. You get a push for buys, sells, the daily loss limit, errors and backtest results.
 
-To stop it: **Actions → Paper trading bot → ⋯ → Disable workflow**, then cancel any running job.
-GitHub pauses scheduled workflows after 60 days without commits to the repo; re-enable it from the Actions tab.
-
-### Backtesting from your phone
-**Actions → Backtest → Run workflow.** It compares 1/5/15-minute bars and three stop/target pairs over recent history, after fees, and puts a table on the run's summary page. If `NTFY_TOPIC` is set, you get a push when it finishes.
+To stop the bot: **Actions → Paper trading bot → ⋯ → Disable workflow**. GitHub pauses schedules after 60 days without commits; re-enable from the Actions tab.

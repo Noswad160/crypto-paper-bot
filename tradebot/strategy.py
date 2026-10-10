@@ -1,11 +1,11 @@
 """VWAP + EMA momentum strategy on 1-minute bars.
 
-Long only (Alpaca doesn't allow shorting crypto).
+Long only.
 
 Entry: the bar where "close > VWAP and fast EMA > slow EMA" first becomes true.
 Exit:  stop loss, take profit, or the trend breaking (close < VWAP or fast EMA < slow EMA).
 
-VWAP is anchored at 00:00 UTC each day, since crypto has no session open.
+VWAP is anchored to each trading day: the stock market open, or 00:00 UTC for crypto.
 """
 from dataclasses import dataclass
 
@@ -16,16 +16,17 @@ from .config import Config
 
 
 def add_indicators(
-    bars: pd.DataFrame, fast: int, slow: int, trend: int = 0, exit_on_trend: bool = True
+    bars: pd.DataFrame, fast: int, slow: int, trend: int = 0, exit_on_trend: bool = True, tz: str = "UTC"
 ) -> pd.DataFrame:
     """bars: DataFrame indexed by UTC timestamp with open/high/low/close/volume columns.
 
     trend: if > 0, only enter when close is also above an EMA of this many bars (a long-term trend filter).
     exit_on_trend: if False, positions only exit on their stop loss or take profit.
+    tz: VWAP restarts at midnight in this time zone (UTC for crypto, New York for stocks).
     """
     df = bars.copy()
     typical = (df["high"] + df["low"] + df["close"]) / 3
-    day = df.index.floor("D")
+    day = df.index.tz_convert(tz).date
     cum_pv = (typical * df["volume"]).groupby(day).cumsum()
     cum_v = df["volume"].groupby(day).cumsum()
     # Zero-volume bars at the start of a day leave VWAP undefined; fall back to price.

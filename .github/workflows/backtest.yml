@@ -9,7 +9,10 @@ on:
         default: "90"
       symbols:
         description: "Symbols (comma-separated)"
-        default: "BTC/USD,ETH/USD"
+        default: "SPY,QQQ,AAPL,MSFT,NVDA,TSLA"
+      asset_class:
+        description: "stocks or crypto"
+        default: "stocks"
 
 jobs:
   backtest:
@@ -28,6 +31,7 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           DAYS: ${{ inputs.days }}
           SYMBOLS: ${{ inputs.symbols }}
+          ASSET_CLASS: ${{ inputs.asset_class }}
         run: |
           python -m tradebot.backtest --sweep --days "$DAYS" --symbols "$SYMBOLS" --markdown results.md --text results.txt
           cat results.md >> "$GITHUB_STEP_SUMMARY"
