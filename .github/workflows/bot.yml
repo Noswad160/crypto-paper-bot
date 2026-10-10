@@ -27,6 +27,7 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: timeout --signal=INT 345m python -m tradebot.live || [ $? -eq 124 ]
       - name: Save logs
         if: always()

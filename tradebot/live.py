@@ -13,6 +13,7 @@ from pathlib import Path
 from .broker import PaperBroker
 from .config import Config
 from .data import CryptoData
+from .notify import notify
 from .strategy import add_indicators, decide
 
 LOG_DIR = Path("logs")
@@ -47,6 +48,7 @@ class Bot:
         self.day = None
         self.halted = False
         self.last_entry_bar = {}  # symbol -> timestamp of the bar we last bought on
+        self.last_error_alert = 0.0
 
     def roll_day(self):
         today = datetime.now(timezone.utc).date()
@@ -67,6 +69,8 @@ class Bot:
             if not self.dry_run:
                 self.broker.close_all()
             self.halted = True
+            notify("Daily loss limit hit", f"Down ${-pnl:,.2f} today. Sold everything; paused until 00:00 UTC.",
+                   priority="high", tags="rotating_light")
         return self.halted
 
     def step(self, symbol: str):
@@ -101,8 +105,15 @@ class Bot:
         if action.kind == "enter":
             order = self.broker.buy(symbol, self.cfg.position_notional_usd)
             self.last_entry_bar[symbol] = last.name
+            notify(f"Bought {symbol}", f"${self.cfg.position_notional_usd:,.0f} at ~${last['close']:,.2f}", tags="chart_with_upwards_trend")
         else:
             order = self.broker.close(symbol)
+            pct = last["close"] / entry - 1
+            notify(
+                f"Sold {symbol} ({action.reason.replace('_', ' ')})",
+                f"~${last['close']:,.2f}, entry ${entry:,.2f}: {pct:+.2%} (~${pct * self.cfg.position_notional_usd:+,.2f} before fees)",
+                tags="white_check_mark" if pct > 0 else "x",
+            )
         journal({
             "time": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "action": action.kind,
             "reason": action.reason, "bar_close": last["close"], "entry_price": entry, "order_id": order.id,
@@ -110,14 +121,18 @@ class Bot:
 
     def run(self):
         log.info("Starting bot (%s) on %s", "DRY RUN" if self.dry_run else "PAPER", ", ".join(self.cfg.symbols))
+        notify("Bot started", "Watching " + ", ".join(self.cfg.symbols), priority="min", tags="robot")
         while True:
             try:
                 self.roll_day()
                 if not self.check_daily_loss():
                     for symbol in self.cfg.symbols:
                         self.step(symbol)
-            except Exception:
+            except Exception as e:
                 log.exception("Loop error; retrying next cycle")
+                if time.time() - self.last_error_alert > 1800:  # at most one error alert per 30 min
+                    self.last_error_alert = time.time()
+                    notify("Trading bot error", f"{type(e).__name__}: {e}"[:300], priority="high", tags="warning")
             # Wake a few seconds after each minute boundary so the last bar is final.
             time.sleep(self.cfg.poll_seconds - time.time() % self.cfg.poll_seconds + 3)
 

@@ -33,7 +33,8 @@ Logs go to `logs/bot.log`, and every order is recorded in `logs/trades.csv`.
 `.github/workflows/bot.yml` runs the bot on GitHub Actions.
 1. In the repo, open **Settings → Secrets and variables → Actions** and add `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (your paper keys).
 2. Open the **Actions** tab → **Paper trading bot** → **Run workflow** to start right away. After that it keeps itself going on an hourly schedule.
-3. Watch trades in the Alpaca app. Each run's log is attached to its run in the Actions tab.
+3. Optional phone alerts: install the **ntfy** app, subscribe to a hard-to-guess topic name, and add that name as a third secret, `NTFY_TOPIC`. You'll get a push for every buy, every sell, the daily loss limit, and errors.
+4. Watch trades in the Alpaca app. Each run's log is attached to its run in the Actions tab.
 
 To stop it: **Actions → Paper trading bot → ⋯ → Disable workflow**, then cancel any running job.
 GitHub pauses scheduled workflows after 60 days without commits to the repo; re-enable it from the Actions tab.
