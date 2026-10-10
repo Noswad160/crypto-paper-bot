@@ -124,6 +124,19 @@ def sweep_markdown(symbol: str, bars_1m: pd.DataFrame, rows: list[dict], cfg: Co
     return "\n".join(out) + "\n"
 
 
+def sweep_text(symbol: str, bars_1m: pd.DataFrame, rows: list[dict], cfg: Config) -> str:
+    """Short plain-text version of the sweep, sized for a phone notification."""
+    hold = cfg.position_notional_usd * (bars_1m["close"].iloc[-1] / bars_1m["close"].iloc[0] - 1)
+    current = next((r for r in rows if r["current"]), rows[0])
+    best = max(rows, key=lambda r: r["net"])
+
+    def line(r):
+        return (f"{r['bars']}m bars, stop {r['sl']:.2%} / target {r['tp']:.1%}: "
+                f"{r['trades']} trades, {r['win_rate']:.0%} wins, ${r['net']:+,.0f}")
+
+    return f"{symbol} (hold: ${hold:+,.0f})\nNow: {line(current)}\nBest: {line(best)}\n"
+
+
 def load_bars(args, cfg: Config, symbol: str) -> pd.DataFrame:
     if args.csv:
         bars = pd.read_csv(args.csv, parse_dates=["timestamp"], index_col="timestamp")
@@ -141,6 +154,7 @@ def main():
     p.add_argument("--csv", help="load bars from a CSV instead of Alpaca")
     p.add_argument("--sweep", action="store_true", help="compare bar sizes and stop/target settings")
     p.add_argument("--markdown", help="with --sweep, also write the results table to this file")
+    p.add_argument("--text", help="with --sweep, also write a short plain-text summary to this file")
     p.add_argument("--out", help="write the trade list to this CSV")
     args = p.parse_args()
     cfg = Config()
@@ -152,6 +166,7 @@ def main():
         f"EMA {cfg.fast_ema}/{cfg.slow_ema}, max {cfg.max_trades_per_day} trades/day. "
         "Past results don't predict future ones.\n",
     ]
+    text = []
     for symbol in symbols:
         bars = load_bars(args, cfg, symbol)
         print(f"\n{symbol}: {len(bars)} bars, {bars.index[0]} -> {bars.index[-1]}")
@@ -160,6 +175,7 @@ def main():
             table = sweep_markdown(symbol, bars, rows, cfg)
             print(table)
             md.append(table)
+            text.append(sweep_text(symbol, bars, rows, cfg))
         else:
             trades = backtest(bars, cfg)
             print(summarize(trades))
@@ -170,6 +186,9 @@ def main():
     if args.sweep and args.markdown:
         with open(args.markdown, "w") as f:
             f.write("\n".join(md))
+    if args.sweep and args.text:
+        with open(args.text, "w") as f:
+            f.write(f"Last {args.days} days, after fees\n\n" + "\n".join(text))
 
 
 if __name__ == "__main__":

@@ -13,11 +13,11 @@ on:
 
 jobs:
   backtest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -29,7 +29,7 @@ jobs:
           DAYS: ${{ inputs.days }}
           SYMBOLS: ${{ inputs.symbols }}
         run: |
-          python -m tradebot.backtest --sweep --days "$DAYS" --symbols "$SYMBOLS" --markdown results.md
+          python -m tradebot.backtest --sweep --days "$DAYS" --symbols "$SYMBOLS" --markdown results.md --text results.txt
           cat results.md >> "$GITHUB_STEP_SUMMARY"
       - name: Send alert
         if: always()
@@ -39,5 +39,8 @@ jobs:
           OK: ${{ job.status == 'success' }}
         run: |
           [ -n "$NTFY_TOPIC" ] || exit 0
-          if [ "$OK" = "true" ]; then title="Backtest finished"; msg="Tap to see results"; else title="Backtest failed"; msg="Tap to see what went wrong"; fi
-          curl -s -H "Title: $title" -H "Tags: bar_chart" -H "Click: $RUN_URL" -d "$msg" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+          if [ "$OK" = "true" ] && [ -s results.txt ]; then
+            curl -s -H "Title: Backtest results" -H "Tags: bar_chart" -H "Click: $RUN_URL" --data-binary @results.txt "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+          else
+            curl -s -H "Title: Backtest failed" -H "Tags: warning" -H "Click: $RUN_URL" -d "Tap to see what went wrong" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+          fi
