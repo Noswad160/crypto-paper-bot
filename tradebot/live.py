@@ -7,7 +7,7 @@ import argparse
 import csv
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .broker import PaperBroker
@@ -46,6 +46,7 @@ class Bot:
         self.broker = PaperBroker(cfg.api_key, cfg.secret_key)
         self.day = None
         self.halted = False
+        self.last_entry_bar = {}  # symbol -> timestamp of the bar we last bought on
 
     def roll_day(self):
         today = datetime.now(timezone.utc).date()
@@ -83,6 +84,14 @@ class Bot:
         )
         if action.kind == "hold":
             return
+        if action.kind == "enter":
+            # Quiet markets can go minutes without a new bar. Only buy on a fresh bar, once.
+            bar_time = last.name
+            if datetime.now(timezone.utc) - bar_time > timedelta(minutes=2):
+                log.info("%s: entry signal is on a stale bar (%s), skipping", symbol, bar_time)
+                return
+            if self.last_entry_bar.get(symbol) == bar_time:
+                return
         if action.kind == "enter" and self.trades_today() >= self.cfg.max_trades_per_day:
             log.info("%s: max trades for today reached, skipping entry", symbol)
             return
@@ -91,6 +100,7 @@ class Bot:
 
         if action.kind == "enter":
             order = self.broker.buy(symbol, self.cfg.position_notional_usd)
+            self.last_entry_bar[symbol] = last.name
         else:
             order = self.broker.close(symbol)
         journal({
