@@ -2,7 +2,14 @@
 
 Day-trades US stocks (default) or crypto on an **Alpaca paper account**. Paper mode is hard-coded in `tradebot/broker.py`.
 
-## Strategy: VWAP + EMA momentum (long only)
+## Strategies (long only, pick one with `STRATEGY`)
+- `vwap_ema` (default): VWAP + EMA momentum, described below.
+- `orb`: **opening range breakout** (stocks). Records the high/low of the first `OR_MINUTES` after the open, then buys the first close above that high, at most once a day. The stop is the range low (`OR_RANGE_STOP=1`) or `STOP_LOSS_PCT`.
+- `dip`: **dip buying.** Buys when the close drops below the lower Bollinger band (`BAND_LEN` bars, `BAND_K` standard deviations). Sells when the price gets back to the average.
+
+All strategies also exit on their stop loss, take profit, and (stocks) at 15:55.
+
+### VWAP + EMA momentum
 - **VWAP** restarts each trading day (the stock market day in New York, or 00:00 UTC for crypto).
 - **Entry:** on the bar where *close > VWAP and EMA(9) > EMA(21)* first becomes true. An optional long-term trend filter (`TREND_EMA`) also requires the close to be above a slow EMA.
 - **Exit:** stop loss, take profit, or (if `EXIT_ON_TREND=1`) the trend breaking.

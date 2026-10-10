@@ -34,12 +34,17 @@ class Config:
         ]
     )
 
-    # Strategy
+    # Strategy: "vwap_ema", "orb" (opening range breakout) or "dip" (dip buying)
+    strategy: str = field(default_factory=lambda: _s("STRATEGY", "vwap_ema"))
     bar_minutes: int = field(default_factory=lambda: _i("BAR_MINUTES", 1))
     fast_ema: int = field(default_factory=lambda: _i("FAST_EMA", 9))
     slow_ema: int = field(default_factory=lambda: _i("SLOW_EMA", 21))
     trend_ema: int = field(default_factory=lambda: _i("TREND_EMA", 0))  # 0 = no long-term trend filter
     exit_on_trend: bool = field(default_factory=lambda: _s("EXIT_ON_TREND", "1") == "1")
+    or_minutes: int = field(default_factory=lambda: _i("OR_MINUTES", 15))  # orb: opening range length
+    or_range_stop: bool = field(default_factory=lambda: _s("OR_RANGE_STOP", "1") == "1")  # orb: stop at range low
+    band_len: int = field(default_factory=lambda: _i("BAND_LEN", 20))  # dip: bars in the moving average
+    band_k: float = field(default_factory=lambda: _f("BAND_K", 2.0))  # dip: standard deviations below average
 
     # Exits
     stop_loss_pct: float = field(default_factory=lambda: _f("STOP_LOSS_PCT", 0.0075))

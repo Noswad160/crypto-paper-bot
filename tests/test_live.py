@@ -83,7 +83,7 @@ def test_flatten_sells_open_positions_once(monkeypatch, tmp_path):
 def test_step_buys_on_fresh_signal_inside_window(monkeypatch, tmp_path):
     closes = [100] * 60 + [100.5]  # flat, then a pop above VWAP with EMAs turning up
     bot = make_bot(monkeypatch, tmp_path, FakeBroker(), bars_ending_now(closes))
-    monkeypatch.setattr(live, "add_session_flags", lambda df, stocks, m: df.assign(can_enter=True, session_end=False))
+    monkeypatch.setattr(live, "add_session_flags", lambda df, stocks, m, start: df.assign(can_enter=True, session_end=False))
     bot.step("SPY")
     assert bot.broker.bought == ["SPY"]
     bot.broker.entry = None
@@ -93,7 +93,7 @@ def test_step_buys_on_fresh_signal_inside_window(monkeypatch, tmp_path):
 
 def test_step_skips_entry_outside_window(monkeypatch, tmp_path):
     bot = make_bot(monkeypatch, tmp_path, FakeBroker(), bars_ending_now([100] * 60 + [100.5]))
-    monkeypatch.setattr(live, "add_session_flags", lambda df, stocks, m: df.assign(can_enter=False, session_end=False))
+    monkeypatch.setattr(live, "add_session_flags", lambda df, stocks, m, start: df.assign(can_enter=False, session_end=False))
     bot.step("SPY")
     assert bot.broker.bought == []
 

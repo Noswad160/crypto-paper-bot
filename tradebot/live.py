@@ -15,8 +15,8 @@ from .broker import PaperBroker
 from .config import Config
 from .data import MarketData
 from .notify import notify
-from .session import FLATTEN, add_session_flags
-from .strategy import add_indicators, decide
+from .session import FLATTEN, add_session_flags, entry_start_for
+from .strategy import decide, signals
 
 LOG_DIR = Path("logs")
 log = logging.getLogger("tradebot")
@@ -101,7 +101,8 @@ class Bot:
 
     def lookback(self) -> timedelta:
         """How far back to fetch so the EMAs are warmed up and today's VWAP is complete."""
-        warmup_minutes = max(self.cfg.slow_ema * 3, self.cfg.trend_ema * 2) * self.cfg.bar_minutes
+        bars_needed = max(self.cfg.slow_ema * 3, self.cfg.trend_ema * 2, self.cfg.band_len * 2)
+        warmup_minutes = bars_needed * self.cfg.bar_minutes
         if self.cfg.stocks:
             # ~390 trading minutes per day, plus room for weekends and holidays.
             return timedelta(days=-(-warmup_minutes // 390) * 2 + 4)
@@ -110,18 +111,17 @@ class Bot:
     def step(self, symbol: str):
         cfg = self.cfg
         bars = self.data.recent_closed_bars(symbol, cfg.bar_minutes, self.lookback())
-        if len(bars) < cfg.slow_ema * 2:
+        if len(bars) < 2:
             log.info("%s: not enough bars yet (%d)", symbol, len(bars))
             return
-        df = add_indicators(bars, cfg.fast_ema, cfg.slow_ema, cfg.trend_ema, cfg.exit_on_trend, cfg.session_tz)
-        last = add_session_flags(df, cfg.stocks, cfg.bar_minutes).iloc[-1]
+        df = add_session_flags(signals(bars, cfg), cfg.stocks, cfg.bar_minutes, entry_start_for(cfg.strategy))
+        last = df.iloc[-1]
         entry = self.broker.entry_price(symbol)
         action = decide(last, entry, cfg)
-        log.info(
-            "%s close=%.2f vwap=%.2f ema%d=%.2f ema%d=%.2f pos=%s -> %s %s",
-            symbol, last["close"], last["vwap"], cfg.fast_ema, last["ema_fast"],
-            cfg.slow_ema, last["ema_slow"], entry, action.kind, action.reason,
-        )
+        detail = {"vwap_ema": ("vwap", "ema_fast", "ema_slow"), "orb": ("or_high", "or_low"),
+                  "dip": ("lower_band", "mean")}[cfg.strategy]
+        log.info("%s close=%.2f %s pos=%s -> %s %s", symbol, last["close"],
+                 " ".join(f"{k}={last[k]:.2f}" for k in detail), entry, action.kind, action.reason)
         if action.kind == "hold":
             return
         if action.kind == "enter":

@@ -3,7 +3,7 @@ import pandas as pd
 
 from tradebot.backtest import backtest
 from tradebot.config import Config
-from tradebot.strategy import add_indicators, decide
+from tradebot.strategy import add_dip, add_indicators, add_orb, decide
 
 
 def make_bars(closes, start="2026-01-01"):
@@ -46,13 +46,13 @@ def test_no_entries_during_warmup():
 
 def test_decide_exits():
     c = cfg(stop_loss_pct=0.01, take_profit_pct=0.02)
-    row = pd.Series({"close": 98.9, "trend_broken": False, "entry": False})
+    row = pd.Series({"close": 98.9, "exit_signal": False, "entry": False})
     assert decide(row, 100, c).reason == "stop_loss"
     row["close"] = 102.1
     assert decide(row, 100, c).reason == "take_profit"
-    row["close"], row["trend_broken"] = 100.5, True
+    row["close"], row["exit_signal"] = 100.5, True
     assert decide(row, 100, c).reason == "trend_broken"
-    row["trend_broken"] = False
+    row["exit_signal"] = False
     assert decide(row, 100, c).kind == "hold"
 
 
@@ -90,7 +90,7 @@ def test_trend_filter_blocks_entries_below_long_term_trend():
 
 def test_stop_target_only_ignores_trend_breaks():
     df = add_indicators(make_bars(np.linspace(110, 100, 60)), 9, 21, exit_on_trend=False)
-    assert not df["trend_broken"].any()
+    assert not df["exit_signal"].any()
 
 
 def stock_bars(closes, day="2026-03-02"):
@@ -132,3 +132,38 @@ def test_stock_vwap_resets_at_new_york_midnight():
     two_days = pd.concat([stock_bars([100] * 390, "2026-03-02"), stock_bars([200] * 390, "2026-03-03")])
     df = add_indicators(two_days, 9, 21, tz="America/New_York")
     assert df["vwap"].iloc[389] == 100 and df["vwap"].iloc[390] == 200
+
+
+def test_orb_buys_first_breakout_only_with_range_low_stop():
+    # First 15 min range 100-101, quiet, breakout at 10:00, a second push later.
+    closes = [100, 101] * 7 + [100.5] + [100.5] * 15 + [101.5] + [100.8] * 20 + [102] + [101] * 330
+    bars = stock_bars(closes)
+    bars["high"], bars["low"] = bars["close"], bars["close"]
+    df = add_orb(bars, 15)
+    assert df["entry"].sum() == 1
+    first = df.index[df["entry"]][0].tz_convert("America/New_York")
+    assert first.strftime("%H:%M") == "10:00"
+    assert df["or_high"].iloc[0] == 101 and df["stop_price"].iloc[-1] == 100
+
+
+def test_orb_backtest_stops_at_range_low():
+    closes = [100, 101] * 7 + [100.5] * 16 + [101.5] + [99] * 60 + [100] * 300
+    bars = stock_bars(closes)
+    bars["high"], bars["low"] = bars["close"], bars["close"]
+    c = cfg(asset_class="stocks", strategy="orb", or_minutes=15, or_range_stop=True, take_profit_pct=1.0,
+            stop_loss_pct=1.0, max_trades_per_day=1)
+    t = backtest(bars, c)
+    assert len(t) == 1 and t.iloc[0].reason == "stop_loss" and t.iloc[0].exit == 99  # bar closed below the stop
+
+
+def test_dip_buys_below_band_and_exits_at_average():
+    closes = [100, 100.2] * 15 + [97] + [98, 99, 100.2, 100.2]
+    df = add_dip(make_bars(closes), length=20, k=2.0)
+    assert df["entry"].sum() == 1 and df["entry"].iloc[30]
+    assert df["exit_signal"].iloc[33]
+
+
+def test_dip_trend_filter_blocks_dips_in_downtrends():
+    closes = list(np.linspace(120, 100, 250)) + [95]
+    assert add_dip(make_bars(closes), 20, 2.0)["entry"].iloc[-1]
+    assert not add_dip(make_bars(closes), 20, 2.0, trend=200)["entry"].iloc[-1]

@@ -13,80 +13,109 @@ import argparse
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 
 from .config import Config
 from .data import resample
-from .session import add_session_flags
-from .strategy import add_indicators
+from .session import add_session_flags, entry_start_for
+from .strategy import EXIT_REASONS, signals
 
 MIN_TRADES = 5  # a variant needs this many trades in the earlier period before its result counts
 
 
 @dataclass(frozen=True)
 class Variant:
+    strategy: str
     bars: int  # bar size in minutes
-    trend: int  # long-term trend filter EMA length in bars, 0 = off
-    exit_on_trend: bool  # exit when VWAP/EMA trend breaks, or only on stop/target
     sl: float
-    tp: float
+    tp: float  # 1.0 (100%) = no target, hold until another exit
     max_per_day: int
+    trend: int = 0  # long-term trend filter EMA length in bars, 0 = off
+    exit_on_trend: bool = True  # vwap_ema: exit when the trend breaks
+    or_minutes: int = 0  # orb: opening range length
+    or_range_stop: bool = False  # orb: stop at the opening range low instead of sl
+    band_k: float = 0.0  # dip: standard deviations below the average
     current: bool = False
 
     def label(self) -> str:
-        parts = [f"{self.bars}m", "trend filter" if self.trend else "no filter",
-                 "trend exits" if self.exit_on_trend else "stop/target only",
-                 f"{self.sl:.1%}/{self.tp:.1%}", f"max {self.max_per_day}/day"]
-        return " · ".join(parts)
+        target = "hold to close" if self.tp >= 1 else f"target {self.tp:.1%}"
+        if self.strategy == "orb":
+            stop = "stop at range low" if self.or_range_stop else f"stop {self.sl:.1%}"
+            return f"ORB {self.or_minutes}min · {stop} · {target}"
+        trend = " · trend filter" if self.trend else ""
+        if self.strategy == "dip":
+            return f"Dip {self.bars}m · {self.band_k:g} std{trend} · stop {self.sl:.0%}"
+        exits = "trend exits" if self.exit_on_trend else "stop/target only"
+        return f"VWAP/EMA {self.bars}m{trend} · {exits} · {self.sl:.1%}/{self.tp:.1%} · max {self.max_per_day}/day"
 
     def apply(self, cfg: Config) -> Config:
-        return replace(cfg, bar_minutes=self.bars, trend_ema=self.trend, exit_on_trend=self.exit_on_trend,
-                       stop_loss_pct=self.sl, take_profit_pct=self.tp, max_trades_per_day=self.max_per_day)
+        return replace(
+            cfg, strategy=self.strategy, bar_minutes=self.bars, trend_ema=self.trend, exit_on_trend=self.exit_on_trend,
+            stop_loss_pct=self.sl, take_profit_pct=self.tp, max_trades_per_day=self.max_per_day,
+            or_minutes=self.or_minutes or cfg.or_minutes, or_range_stop=self.or_range_stop,
+            band_k=self.band_k or cfg.band_k,
+        )
+
+
+STRATEGY_NAMES = {"vwap_ema": "VWAP/EMA momentum", "orb": "Opening range breakout", "dip": "Dip buying"}
+NO_TARGET = 1.0
 
 
 def variants(cfg: Config) -> list[Variant]:
-    """What the live bot does now, plus a grid of alternatives."""
-    current = Variant(cfg.bar_minutes, cfg.trend_ema, cfg.exit_on_trend, cfg.stop_loss_pct,
-                      cfg.take_profit_pct, cfg.max_trades_per_day, current=True)
-    if cfg.stocks:
-        # Commission-free, so faster bars and tighter exits are worth testing. Moves within a
-        # single stock-market day are smaller than crypto's, so targets are smaller too.
-        grid = dict(bars=(1, 5, 15), stops=((0.005, 0.01), (0.01, 0.02), (0.02, 0.04)), per_day=4)
+    """What the live bot does now, plus a grid of alternatives for each strategy."""
+    current = Variant(cfg.strategy, cfg.bar_minutes, cfg.stop_loss_pct, cfg.take_profit_pct, cfg.max_trades_per_day,
+                      cfg.trend_ema, cfg.exit_on_trend, cfg.or_minutes if cfg.strategy == "orb" else 0,
+                      cfg.or_range_stop if cfg.strategy == "orb" else False,
+                      cfg.band_k if cfg.strategy == "dip" else 0.0, current=True)
+    if not cfg.stocks:
+        others = [
+            Variant("vwap_ema", bars, sl, tp, 2, trend, exit_on_trend)
+            for bars in (15, 60) for trend in (0, 200) for exit_on_trend in (True, False)
+            for sl, tp in ((0.015, 0.03), (0.025, 0.05), (0.04, 0.08))
+        ]
     else:
-        grid = dict(bars=(15, 60), stops=((0.015, 0.03), (0.025, 0.05), (0.04, 0.08)), per_day=2)
-    others = [
-        Variant(bars, trend, exit_on_trend, sl, tp, grid["per_day"])
-        for bars in grid["bars"]
-        for trend in (0, 200)
-        for exit_on_trend in (True, False)
-        for sl, tp in grid["stops"]
-    ]
+        others = [
+            Variant("vwap_ema", bars, sl, tp, 4, trend, exit_on_trend)
+            for bars in (1, 5, 15) for trend in (0, 200) for exit_on_trend in (True, False)
+            for sl, tp in ((0.005, 0.01), (0.01, 0.02), (0.02, 0.04))
+        ] + [
+            Variant("orb", 1, sl, tp, 1, exit_on_trend=False, or_minutes=m, or_range_stop=range_stop)
+            for m in (5, 15, 30)
+            for range_stop, sl in ((True, NO_TARGET), (False, 0.005), (False, 0.01))
+            for tp in (NO_TARGET, 0.01, 0.02)
+        ] + [
+            Variant("dip", bars, sl, NO_TARGET, 2, trend, band_k=k)
+            for bars in (5, 15) for k in (2.0, 2.5) for trend in (0, 200) for sl in (0.01, 0.02)
+        ]
     return [current] + [v for v in others if replace(v, current=True) != current]
 
 
 def backtest(bars: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    df = add_indicators(bars, cfg.fast_ema, cfg.slow_ema, cfg.trend_ema, cfg.exit_on_trend, cfg.session_tz)
-    df = add_session_flags(df, cfg.stocks, cfg.bar_minutes)
+    df = add_session_flags(signals(bars, cfg), cfg.stocks, cfg.bar_minutes, entry_start_for(cfg.strategy))
     days = df.index.tz_convert(cfg.session_tz).date
+    stops = df["stop_price"] if "stop_price" in df else pd.Series(np.nan, index=df.index)
+    exit_reason = EXIT_REASONS[cfg.strategy]
     size = cfg.position_notional_usd
-    trades, entry, entry_time = [], None, None
+    trades, entry, entry_time, stop = [], None, None, None
     entries_per_day: dict = {}
-    for ts, day, high, low, close, is_entry, broken, can_enter, session_end in zip(
-        df.index, days, df["high"], df["low"], df["close"], df["entry"], df["trend_broken"],
-        df["can_enter"], df["session_end"],
+    for ts, day, high, low, close, is_entry, exit_signal, can_enter, session_end, stop_price in zip(
+        df.index, days, df["high"], df["low"], df["close"], df["entry"], df["exit_signal"],
+        df["can_enter"], df["session_end"], stops,
     ):
         if entry is None:
             if is_entry and can_enter and entries_per_day.get(day, 0) < cfg.max_trades_per_day:
                 entries_per_day[day] = entries_per_day.get(day, 0) + 1
                 entry, entry_time = close, ts
+                stop = stop_price if pd.notna(stop_price) else entry * (1 - cfg.stop_loss_pct)
             continue
-        stop, target = entry * (1 - cfg.stop_loss_pct), entry * (1 + cfg.take_profit_pct)
+        target = entry * (1 + cfg.take_profit_pct)
         if low <= stop:
-            exit_price, reason = stop, "stop_loss"
+            exit_price, reason = min(stop, close), "stop_loss"
         elif high >= target:
             exit_price, reason = target, "take_profit"
-        elif broken:
-            exit_price, reason = close, "trend_broken"
+        elif exit_signal:
+            exit_price, reason = close, exit_reason
         elif session_end:
             exit_price, reason = close, "end_of_day"
         else:
@@ -169,31 +198,41 @@ def nums(r: dict) -> str:
             f"recent ${r['late']['net']:+,.0f} ({r['late']['trades']})")
 
 
+def best_per_strategy(rows: list[dict]) -> dict[str, dict]:
+    """Best variant of each strategy, picked on the earlier period (rows are already ranked)."""
+    best: dict[str, dict] = {}
+    for r in rows:
+        if not r["v"].current:
+            best.setdefault(r["v"].strategy, r)
+    return best
+
+
+def robust_count(rows: list[dict], strategy: str) -> str:
+    group = [r for r in rows if r["v"].strategy == strategy and not r["v"].current]
+    both = sum(r["early"]["net"] > 0 and r["late"]["net"] > 0 for r in group)
+    return f"{both}/{len(group)}"
+
+
 def symbol_text(symbol: str, early_hold: float, late_hold: float, rows: list[dict]) -> str:
-    current = next(r for r in rows if r["v"].current)
-    best = next(r for r in rows if not r["v"].current)
-    both = sum(r["early"]["net"] > 0 and r["late"]["net"] > 0 for r in rows if not r["v"].current)
-    return "\n".join([
-        f"{symbol} (hold: earlier ${early_hold:+,.0f}, recent ${late_hold:+,.0f})",
-        f"Current: {nums(current)}",
-        f"Best: {best['v'].label()}: {nums(best)}",
-        f"Profitable in both: {both} of {len(rows) - 1}",
-    ]) + "\n"
+    lines = [f"{symbol} (hold: earlier ${early_hold:+,.0f}, recent ${late_hold:+,.0f})"]
+    for strategy, r in best_per_strategy(rows).items():
+        lines.append(f"{r['v'].label()}: {nums(r)}")
+    return "\n".join(lines) + "\n"
 
 
 def overall_text(combined: list[dict], n_symbols: int, early_hold: float, late_hold: float) -> str:
     current = next(r for r in combined if r["v"].current)
-    others = [r for r in combined if not r["v"].current]
     lines = [
         f"ALL {n_symbols} SYMBOLS COMBINED",
         f"Hold all: earlier ${early_hold:+,.0f}, recent ${late_hold:+,.0f}",
-        f"Current: {nums(current)}",
-        "Top 3 (picked on earlier data):",
+        f"Live bot now: {nums(current)}",
+        "",
+        "Best of each strategy (picked on earlier data):",
     ]
-    for i, r in enumerate(others[:3], 1):
-        lines.append(f"{i}. {r['v'].label()}: {nums(r)}, works on {r['symbols_both']}/{n_symbols}")
-    robust = sum(r["early"]["net"] > 0 and r["late"]["net"] > 0 for r in others)
-    lines.append(f"Profitable in both periods overall: {robust} of {len(others)}")
+    for strategy, r in best_per_strategy(combined).items():
+        lines.append(f"{STRATEGY_NAMES[strategy]}: {r['v'].label()}")
+        lines.append(f"  {nums(r)}, works on {r['symbols_both']}/{n_symbols} symbols")
+        lines.append(f"  versions profitable in both periods: {robust_count(combined, strategy)}")
     return "\n".join(lines) + "\n"
 
 
